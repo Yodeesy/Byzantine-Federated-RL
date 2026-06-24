@@ -60,23 +60,45 @@ def run(opts):
             # Set the random seed
             torch.manual_seed(run_id)
             np.random.seed(run_id)
-            
-            nn_parms_worker = Worker(
-                id = 0,
-                is_Byzantine = False,
-                env_name = opts.env_name,
-                gamma = opts.gamma,
-                hidden_units = opts.hidden_units, 
-                activation = opts.activation, 
-                output_activation = opts.output_activation,
-                max_epi_len = opts.max_epi_len,
-                opts = opts
-            ).to(opts.device)
-            
-            # Load data from random policy
-            model_actor = get_inner_model(agent.master.logits_net)
-            model_actor.load_state_dict({**model_actor.state_dict(), **get_inner_model(nn_parms_worker.logits_net).state_dict()})
-        
+
+            # Initialize master(s) with fresh random weights for this run
+            if opts.ensemble:
+                # Ensemble mode: initialize each group master with fresh random weights
+                for k in range(agent.num_groups):
+                    nn_parms_worker = Worker(
+                        id=0,
+                        is_Byzantine=False,
+                        env_name=opts.env_name,
+                        gamma=opts.gamma,
+                        hidden_units=opts.hidden_units,
+                        activation=opts.activation,
+                        output_activation=opts.output_activation,
+                        max_epi_len=opts.max_epi_len,
+                        opts=opts
+                    ).to(opts.device)
+                    model_actor = get_inner_model(agent.group_masters[k].logits_net)
+                    model_actor.load_state_dict({
+                        **model_actor.state_dict(),
+                        **get_inner_model(nn_parms_worker.logits_net).state_dict()
+                    })
+            else:
+                # Non-ensemble: initialize the single master with fresh random weights
+                nn_parms_worker = Worker(
+                    id=0,
+                    is_Byzantine=False,
+                    env_name=opts.env_name,
+                    gamma=opts.gamma,
+                    hidden_units=opts.hidden_units,
+                    activation=opts.activation,
+                    output_activation=opts.output_activation,
+                    max_epi_len=opts.max_epi_len,
+                    opts=opts
+                ).to(opts.device)
+
+                # Load data from random policy
+                model_actor = get_inner_model(agent.master.logits_net)
+                model_actor.load_state_dict({**model_actor.state_dict(), **get_inner_model(nn_parms_worker.logits_net).state_dict()})
+
             # Start training here
             agent.start_training(tb_writer, run_id)
             if tb_writer:

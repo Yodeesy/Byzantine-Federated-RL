@@ -42,9 +42,39 @@ def get_options(args=None):
                         help = 'number of worker node that is Byzantine')
     parser.add_argument('--alpha', type=float, default=0.4, 
                         help = 'atmost alpha-fractional worker nodes are Byzantine')
-    parser.add_argument('--attack_type', type=str, default='filtering-attack', 
-                        choices = ['zero-gradient', 'random-action', 'sign-flipping', 'reward-flipping', 'random-reward', 'random-noise', 'FedScsPG-attack'],
+    parser.add_argument('--attack_type', type=str, default='filtering-attack',
+                        choices = ['zero-gradient', 'random-action', 'sign-flipping', 'reward-flipping', 'random-reward', 'random-noise', 'FedScsPG-attack', 'normalized-attack', 'divergence-attack'],
                         help = 'the behavior scheme of a Byzantine worker')
+
+    # Ensemble defense (WWW 2025)
+    parser.add_argument('--ensemble', action='store_true', default=False,
+                        help='Enable ensemble defense (K groups, each trains independent global policy)')
+    parser.add_argument('--num_groups', '-K', type=int, default=5,
+                        help='Number of groups for ensemble defense')
+
+    # Secure Aggregation (SecAgg)
+    parser.add_argument('--use_secagg', action='store_true', default=False,
+                        help='Enable secure aggregation. Server sees only '
+                             'masked gradients; FedPG-BR filtering disabled.')
+
+    # Override FedPG-BR / Normalized Attack hyperparams (for reproduction tuning)
+    parser.add_argument('--sigma', type=float, default=None,
+                        help='Override FedPG-BR variance bound sigma (default: env-specific)')
+    parser.add_argument('--lambda_hat', type=float, default=None,
+                        help='Override Normalized Attack lambda_hat (default: env-specific)')
+    parser.add_argument('--zeta_hat', type=float, default=None,
+                        help='Override Normalized Attack zeta_hat (default: env-specific)')
+
+    # Divergence Attack (Cross-Group)
+    parser.add_argument('--entropy_threshold', type=float, default=None,
+                        help='Entropy threshold for divergence attack trigger states '
+                             '(default: 0.6 * log(n_actions))')
+    parser.add_argument('--target_action', type=int, default=0,
+                        help='Target action Byzantine workers push toward in divergence attack')
+    parser.add_argument('--target_action_mode', type=str,
+                        choices=['fixed', 'group-mod'], default='fixed',
+                        help='"fixed": all Byzantine push --target_action; '
+                             '"group-mod": each Byzantine pushes group_id %% n_actions')
         
     
     # RL Algorithms (default GOMDP)
@@ -68,6 +98,11 @@ def get_options(args=None):
 
     ### end of parameters
     opts = parser.parse_args(args)
+
+    # Save CLI overrides before env-specific defaults overwrite them
+    _sigma_override = opts.sigma
+    _lambda_hat_override = opts.lambda_hat
+    _zeta_hat_override = opts.zeta_hat
 
     opts.use_cuda = False
     opts.run_name = "{}_{}".format(opts.run_name, time.strftime("%Y%m%dT%H%M%S"))
@@ -112,7 +147,18 @@ def get_options(args=None):
         opts.delta = 0.6
         opts.sigma = 0.06
 
-  
+        # Normalized attack hyperparameters (WWW 2025, Table 4)
+        # lambda_hat: initial step size for direction optimization (Stage I)
+        # zeta_hat: initial step size for magnitude optimization (Stage II)
+        # Both decay by factor 1/3 each iteration
+        opts.lambda_hat = 0.83
+        opts.zeta_hat = 0.03
+
+        # Divergence attack entropy threshold (0.6 * ln(2))
+        if opts.entropy_threshold is None:
+            opts.entropy_threshold = 0.42
+
+
     elif opts.env_name == 'HalfCheetah-v2':
         # Task-Specified Hyperparameters
         opts.max_epi_len = 500  
@@ -140,6 +186,14 @@ def get_options(args=None):
         # Filtering hyperparameters for FT-FedScsPG
         opts.delta = 0.6
         opts.sigma = 0.9
+
+        # Normalized attack hyperparameters (WWW 2025, Table 4)
+        opts.lambda_hat = 0.83
+        opts.zeta_hat = 0.2
+
+        # Divergence attack (continuous: use variance-based trigger)
+        if opts.entropy_threshold is None:
+            opts.entropy_threshold = 0.5  # action variance threshold
 
 
     if opts.env_name == 'LunarLander-v2':
@@ -170,7 +224,23 @@ def get_options(args=None):
         opts.delta = 0.6
         opts.sigma = 0.07
 
+        # Normalized attack hyperparameters (WWW 2025, Table 4)
+        opts.lambda_hat = 1.0
+        opts.zeta_hat = 0.02
+
+        # Divergence attack entropy threshold (0.6 * ln(4))
+        if opts.entropy_threshold is None:
+            opts.entropy_threshold = 0.83
+
+    # Allow CLI override of key hyperparams for reproduction tuning
+    if _sigma_override is not None:
+        opts.sigma = _sigma_override
+    if _lambda_hat_override is not None:
+        opts.lambda_hat = _lambda_hat_override
+    if _zeta_hat_override is not None:
+        opts.zeta_hat = _zeta_hat_override
+
     assert opts.SVRPG + opts.FedPG_BR <= 1
     print('run GPMDP\n' if opts.SVRPG + opts.FedPG_BR == 0 else ('run FT-FedScsPG\n' if opts.FedPG_BR else 'run SVRPG\n'))
-    
+
     return opts

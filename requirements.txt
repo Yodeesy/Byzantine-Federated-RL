@@ -1,6 +1,8 @@
-tensorboard
-tqdm
-sklearn
-matplotlib
-Box2d
-gym[all]==0.24.1
+gymnasium>=0.29.0
+numpy>=1.21.0
+torch>=1.13.0
+scipy>=1.7.0
+scikit-learn>=1.0.0
+matplotlib>=3.5.0
+tqdm>=4.60.0
+tensorboard>=2.10.0

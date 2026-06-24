@@ -10,7 +10,7 @@ from itertools import repeat
 from scipy.interpolate import Rbf
 import scipy.stats as st
 
-from worker import Worker
+from worker import Worker, _reset_env, _step_env
 from utils import torch_load_cpu, get_inner_model, env_wrapper
 
 class Memory:
@@ -37,16 +37,103 @@ def euclidean_dist(x, y):
     return dist
 
 def worker_run(worker, param, opts, Batch_size, seed):
-    
+
     # distribute current parameters
     worker.load_param_from_master(param)
-    worker.env.seed(seed)
-    
-    # get returned gradients and info from all agents        
+    # Set seed for reproducibility (compatible with both gym and gymnasium)
+    _reset_env(worker.env, seed=seed)
+
+    # get returned gradients and info from all agents
     out = worker.train_one_epoch(Batch_size, opts.device, opts.do_sample_for_training)
-    
+
     # store all values
     return out
+
+
+# =============================================================================
+# Helper functions for Normalized Attack (WWW 2025, Section 4.2)
+# =============================================================================
+
+def flatten_grads_for_attack(gradient_list):
+    """Flatten a list of per-worker gradients into a 2D tensor.
+
+    Args:
+        gradient_list: list of [num_workers] lists, each containing per-parameter
+                       gradient tensors. gradient_list[i][p] = tensor for worker i, param p.
+    Returns:
+        flat_tensor: shape [num_workers, total_dim]
+        shapes: list of tensor shapes for later unflattening
+    """
+    shapes = [p.shape for p in gradient_list[0]]
+    flat_tensors = []
+    for worker_grads in gradient_list:
+        worker_flat = torch.cat([p.data.view(-1) for p in worker_grads])
+        flat_tensors.append(worker_flat)
+    return torch.stack(flat_tensors), shapes
+
+
+def unflatten_grads_from_attack(flat_tensor, gradient_template):
+    """Reshape a 2D flat gradient tensor back to the original list-of-lists format.
+
+    Args:
+        flat_tensor: shape [num_workers, total_dim]
+        gradient_template: original gradient list providing shapes
+    Returns:
+        gradient_list: same structure as gradient_template
+    """
+    num_workers = flat_tensor.size(0)
+    shapes = [p.shape for p in gradient_template[0]]
+    result = []
+    for w in range(num_workers):
+        worker_grads = []
+        offset = 0
+        for shape in shapes:
+            numel = shape.numel()
+            worker_grads.append(flat_tensor[w, offset:offset + numel].view(shape).clone())
+            offset += numel
+        result.append(worker_grads)
+    return result
+
+
+def weiszfeld_geometric_median(points, eps=1e-6, max_iter=100):
+    """Compute the geometric median of a set of points using the Weiszfeld algorithm.
+
+    The geometric median minimizes sum_i ||points[i] - median||.
+    Used in ensemble defense (WWW 2025, Eq. 12) for continuous action spaces.
+
+    Args:
+        points: tensor of shape [K, d] — K points in d-dimensional space
+        eps: convergence threshold
+        max_iter: maximum iterations
+    Returns:
+        median: tensor of shape [d]
+    """
+    if points.size(0) == 1:
+        return points[0].clone()
+
+    # Initialize at coordinate-wise median
+    median = points.median(dim=0).values
+
+    for _ in range(max_iter):
+        diffs = points - median.unsqueeze(0)
+        norms = torch.norm(diffs, dim=1)
+
+        # Avoid division by zero: skip points that coincide with the current estimate
+        mask = norms > eps
+        if mask.sum() == 0:
+            break
+
+        weights = 1.0 / norms
+        weights[~mask] = 0.0
+
+        new_median = (points * weights.unsqueeze(-1)).sum(dim=0) / weights.sum()
+
+        if torch.norm(new_median - median) < eps:
+            return new_median
+
+        median = new_median
+
+    return median
     
 
 
@@ -91,24 +178,90 @@ class Agent:
         self.true_Byzantine = []
         for i in range(self.world_size):
             self.true_Byzantine.append(True if i < opts.num_Byzantine else False)
-            self.workers.append( Worker(
-                                    id = i+1,
-                                    is_Byzantine = True if i < opts.num_Byzantine else False,
-                                    env_name = opts.env_name,
-                                    gamma = opts.gamma,
-                                    hidden_units = opts.hidden_units, 
-                                    activation = opts.activation, 
-                                    output_activation = opts.output_activation,
-                                    attack_type =  opts.attack_type,
-                                    max_epi_len = opts.max_epi_len,
-                                    opts = opts
-                            ).to(opts.device))
+            w = Worker(
+                    id = i+1,
+                    is_Byzantine = True if i < opts.num_Byzantine else False,
+                    env_name = opts.env_name,
+                    gamma = opts.gamma,
+                    hidden_units = opts.hidden_units,
+                    activation = opts.activation,
+                    output_activation = opts.output_activation,
+                    attack_type =  opts.attack_type,
+                    max_epi_len = opts.max_epi_len,
+                    opts = opts
+            ).to(opts.device)
+            w.group_id = -1  # non-ensemble mode
+            self.workers.append(w)
         print(f'{opts.num_worker} workers initilized with {opts.num_Byzantine if opts.num_Byzantine >0 else "None"} of them are Byzantine.')
-        
-        if not opts.eval_only:
+
+        # =====================================================================
+        # Ensemble Defense setup (WWW 2025, Section 5)
+        # Partition workers into K non-overlapping groups by hashing worker IDs.
+        # Each group independently trains a global policy using any foundational
+        # aggregation rule (FedPG-BR, GOMDP, etc.).
+        #
+        # During testing:
+        #   Discrete actions  → majority vote (Eq. 10-11)
+        #   Continuous actions → geometric median (Eq. 12)
+        # =====================================================================
+        self.ensemble = opts.ensemble if hasattr(opts, 'ensemble') else False
+        self.num_groups = opts.num_groups if hasattr(opts, 'num_groups') else 5
+
+        if self.ensemble:
+            K = self.num_groups
+            # Partition workers by hash(w.id) % K
+            self.group_workers = [[] for _ in range(K)]
+            for w in self.workers:
+                group_idx = hash(w.id) % K
+                w.group_id = group_idx  # for Cross-Group Divergence Attack
+                self.group_workers[group_idx].append(w)
+
+            # Create K independent master policies, old masters, and optimizers
+            self.group_masters = []
+            self.group_old_masters = []
+            self.group_optimizers = []
+            for k in range(K):
+                master_k = Worker(
+                    id=-(k + 1),
+                    is_Byzantine=False,
+                    env_name=opts.env_name,
+                    gamma=opts.gamma,
+                    hidden_units=opts.hidden_units,
+                    activation=opts.activation,
+                    output_activation=opts.output_activation,
+                    max_epi_len=opts.max_epi_len,
+                    opts=opts
+                ).to(opts.device)
+                self.group_masters.append(master_k)
+
+                old_master_k = Worker(
+                    id=-(k + 1 + K),
+                    is_Byzantine=False,
+                    env_name=opts.env_name,
+                    gamma=opts.gamma,
+                    hidden_units=opts.hidden_units,
+                    activation=opts.activation,
+                    output_activation=opts.output_activation,
+                    max_epi_len=opts.max_epi_len,
+                    opts=opts
+                ).to(opts.device)
+                self.group_old_masters.append(old_master_k)
+
+                if not opts.eval_only:
+                    self.group_optimizers.append(
+                        optim.Adam(master_k.logits_net.parameters(), lr=opts.lr_model)
+                    )
+
+            # Print group sizes
+            group_sizes = [len(g) for g in self.group_workers]
+            print(f'Ensemble mode: {K} groups, sizes: {group_sizes}')
+            print(f'  Byzantine workers per group: '
+                  + ', '.join([str(sum(1 for w in g if w.is_Byzantine)) for g in self.group_workers]))
+
+        if not opts.eval_only and not self.ensemble:
             # figure out the optimizer
             self.optimizer = optim.Adam(self.master.logits_net.parameters(), lr = opts.lr_model)
-        
+
         self.pool = Pool(self.world_size)
         self.memory = Memory()
     
@@ -154,10 +307,646 @@ class Agent:
     def train(self):
         # turn model to trainig mode
         self.master.train()
-        
-    
+
+    # =========================================================================
+    # Helper: flatten / unflatten gradient lists (instance methods for convenience)
+    # =========================================================================
+
+    def _flatten_gradient_list(self, gradient_list):
+        """Instance wrapper for flatten_grads_for_attack."""
+        return flatten_grads_for_attack(gradient_list)
+
+    def _unflatten_gradient_list(self, flat_tensor, gradient_template):
+        """Instance wrapper for unflatten_grads_from_attack."""
+        return unflatten_grads_from_attack(flat_tensor, gradient_template)
+
+    # =========================================================================
+    # Compute AR (Aggregated Result) on flat gradient vectors
+    # Used by the Normalized Attack to simulate the server's aggregation rule.
+    # =========================================================================
+
+    def _compute_ar_flat(self, mu_vec, opts, world_size):
+        """Compute the aggregated result AR{·} on flattened gradient vectors.
+
+        Supports both GOMDP (coordinate-wise mean) and FedPG-BR
+        (median-of-means filtering). Used by the Normalized Attack to
+        simulate the server's aggregation rule during optimization.
+
+        Args:
+            mu_vec: Flattened per-worker gradients, shape [num_workers, dim].
+            opts: Options namespace.
+            world_size: Number of workers.
+
+        Returns:
+            Aggregated gradient vector, shape [dim].
+        """
+        if opts.FedPG_BR:
+            # FedPG-BR aggregation (same logic as start_training)
+            dist = euclidean_dist(mu_vec, mu_vec)
+            V = 2 * np.log(2 * world_size / opts.delta)
+            sigma = opts.sigma
+            threshold = 2 * sigma * np.sqrt(V / opts.B)
+            alpha = opts.alpha
+
+            k_prime = (dist <= threshold).sum(-1) > (0.5 * world_size)
+
+            if torch.sum(k_prime) > 0:
+                mu_mean_vec = torch.mean(mu_vec[k_prime], 0).view(1, -1)
+                mu_med_vec = mu_vec[k_prime][
+                    euclidean_dist(mu_mean_vec, mu_vec[k_prime]).argmin()
+                ].view(1, -1)
+                Good_set = (euclidean_dist(mu_vec, mu_med_vec) <= 1 * threshold).view(-1)
+            else:
+                Good_set = k_prime
+
+            if torch.sum(Good_set) < (1 - alpha) * world_size or torch.sum(Good_set) == 0:
+                k_prime = (dist <= 2 * sigma).sum(-1) > (0.5 * world_size)
+                if torch.sum(k_prime) > 0:
+                    mu_mean_vec = torch.mean(mu_vec[k_prime], 0).view(1, -1)
+                    mu_med_vec = mu_vec[k_prime][
+                        euclidean_dist(mu_mean_vec, mu_vec[k_prime]).argmin()
+                    ].view(1, -1)
+                    Good_set = (euclidean_dist(mu_vec, mu_med_vec) <= 2 * sigma).view(-1)
+                else:
+                    Good_set = torch.zeros(world_size).to(mu_vec.device).bool()
+
+            if torch.sum(Good_set) > 0:
+                return mu_vec[Good_set].mean(dim=0)
+            else:
+                return mu_vec.mean(dim=0)  # fallback
+        else:
+            # GOMDP: AR is simply the coordinate-wise mean
+            return mu_vec.mean(dim=0)
+
+    # =========================================================================
+    # Normalized Attack (WWW 2025, Section 4.2, Eq. 6-9)
+    #
+    # Two-stage optimization performed on the server side:
+    #   Stage I  — find optimal direction by adjusting lambda (Eq. 6-8)
+    #   Stage II — find optimal magnitude by adjusting zeta   (Eq. 9)
+    #
+    # The goal is to maximize the angle deviation between
+    # pre-attack AR and post-attack AR_hat.
+    # =========================================================================
+
+    def _normalized_attack(self, gradient, opts, byzantine_indices=None):
+        """Execute the Normalized Attack on the server side.
+
+        Called after collecting gradients from all workers, before the
+        aggregation rule runs.  Only Byzantine workers' gradients are modified.
+
+        Implements the two-stage Normalized Attack (WWW 2025, Section 4.2):
+          Stage I  (Eq. 6-8):  find optimal direction λ
+          Stage II (Eq. 9):    find optimal magnitude ζ
+
+        To bypass distance-based filters like FedPG-BR, Byzantine gradient
+        norms are matched to the average honest norm during optimisation.
+        """
+        num_workers = len(gradient)
+        if byzantine_indices is None:
+            byzantine_indices = list(range(opts.num_Byzantine))
+        honest_indices = [i for i in range(num_workers)
+                          if i not in set(byzantine_indices)]
+
+        # ---- Flatten all gradients to [num_workers, dim] ----
+        flat_grads, shapes = self._flatten_gradient_list(gradient)
+
+        # ---- Delta = -sign(Avg{g_i : i in [n]})  (Table 4, Table 6 "sgn") ----
+        # In every parameter dimension, Delta pushes against the current update
+        # direction, aiming to pull the global policy toward the 180° opposite
+        # direction for maximal untargeted damage.
+        avg_grad = flat_grads.mean(dim=0)          # Avg{g_i}
+        Delta = -torch.sign(avg_grad)              # perturbation vector (Paper Table 6)
+
+        # ---- Reference direction: unit vector of honest mean ----
+        AR_original = flat_grads.mean(dim=0)
+        AR_original_norm = AR_original / (AR_original.norm() + 1e-10)
+
+        # ---- Average honest norm (for stealth matching) ----
+        avg_honest_norm = torch.stack(
+            [flat_grads[i].norm() for i in honest_indices]).mean()
+
+        # Hyperparameters (Table 4)
+        lambda_hat = opts.lambda_hat                # initial step size, Stage I
+        zeta_hat = opts.zeta_hat                    # initial step size, Stage II
+        decay = 1.0 / 3.0                           # decay each iteration
+        max_iter = 15                                # safety cap
+
+        # =================================================================
+        # Stage I: Optimize direction (λ)  — Eqs. (6)-(8)
+        # g_j = AR/||AR|| + λ·Δ,  then norm-matched to avg_honest_norm
+        # =================================================================
+        best_lambda = lambda_hat
+        best_angle = 0.0
+        best_flat_grads = flat_grads.clone()
+
+        for iteration in range(max_iter):
+            if iteration == 0:
+                candidates = [lambda_hat]
+            else:
+                candidates = [best_lambda + lambda_hat, best_lambda - lambda_hat]
+
+            improved = False
+            for lam in candidates:
+                modified = flat_grads.clone()
+                # Byzantine ← malicious direction
+                for b_idx in byzantine_indices:
+                    g_mal = AR_original_norm + lam * Delta
+                    # Stealth: match norm to honest workers
+                    g_norm = g_mal.norm() + 1e-10
+                    modified[b_idx] = (g_mal / g_norm) * avg_honest_norm
+
+                # Evaluate with mean aggregation
+                AR_hat = modified.mean(dim=0)
+                AR_hat_norm = AR_hat / (AR_hat.norm() + 1e-10)
+                # Angle deviation (Eq. 7-8)
+                angle_dev = (AR_original_norm - AR_hat_norm).norm()
+
+                if angle_dev > best_angle:
+                    best_angle = angle_dev
+                    best_lambda = lam
+                    best_flat_grads = modified.clone()
+                    improved = True
+
+            if not improved and iteration > 0:
+                break
+            lambda_hat *= decay
+            if lambda_hat < 1e-6:
+                break
+
+        # =================================================================
+        # Stage II: Optimize magnitude (ζ)  — Eq. (9)
+        # g̃_j = (g_j / ||g_j||) · ζ
+        # where g_j is the Stage-I result.
+        # =================================================================
+        flat_grads_s1 = best_flat_grads.clone()
+        best_zeta = avg_honest_norm.item()          # start near honest norm
+        best_angle_s2 = best_angle
+
+        for iteration in range(max_iter):
+            candidates = [best_zeta + zeta_hat, best_zeta - zeta_hat]
+            improved = False
+            for zeta in candidates:
+                if zeta <= 0:
+                    continue
+
+                modified = flat_grads_s1.clone()
+                for b_idx in byzantine_indices:
+                    g_j = flat_grads_s1[b_idx]
+                    g_norm = g_j.norm() + 1e-10
+                    modified[b_idx] = (g_j / g_norm) * zeta
+
+                AR_hat = modified.mean(dim=0)
+                AR_hat_norm = AR_hat / (AR_hat.norm() + 1e-10)
+                angle_dev = (AR_original_norm - AR_hat_norm).norm()
+
+                if angle_dev > best_angle_s2:
+                    best_angle_s2 = angle_dev
+                    best_zeta = zeta
+                    best_flat_grads = modified.clone()
+                    improved = True
+
+            if not improved:
+                break
+            zeta_hat *= decay
+            if zeta_hat < 1e-8:
+                break
+
+        # ---- Unflatten back to original list-of-list format ----
+        return self._unflatten_gradient_list(best_flat_grads, gradient)
+
+    # =========================================================================
+    # Ensemble Defense (WWW 2025, Section 5)
+    # =========================================================================
+
+    def ensemble_predict(self, obs, device, sample=False):
+        """Predict action via ensemble of K independently trained group policies.
+
+        For discrete action spaces, uses majority vote (WWW 2025, Eqs. 10-11).
+        For continuous action spaces, uses the geometric median computed by
+        the Weiszfeld algorithm (WWW 2025, Eq. 12).
+
+        Args:
+            obs: Observation vector (numpy array).
+            device: Torch device for inference.
+            sample: If True, sample from policy; if False, take greedy action.
+
+        Returns:
+            Predicted action (int for discrete, numpy array for continuous).
+        """
+        from gymnasium.spaces import Discrete
+
+        obs_tensor = torch.as_tensor(obs, dtype=torch.float32).to(device)
+        is_discrete = isinstance(self.group_masters[0].env.action_space, Discrete)
+
+        if is_discrete:
+            # ---- Discrete: majority vote (Eq. 10-11) ----
+            actions = []
+            for k in range(self.num_groups):
+                act, _ = self.group_masters[k].logits_net(obs_tensor, sample=sample)
+                actions.append(act)
+
+            # Count frequencies and pick argmax
+            from collections import Counter
+            counts = Counter(actions)
+            return counts.most_common(1)[0][0]
+        else:
+            # ---- Continuous: geometric median (Eq. 12) ----
+            actions = []
+            for k in range(self.num_groups):
+                act, _ = self.group_masters[k].logits_net(obs_tensor, sample=sample)
+                actions.append(torch.as_tensor(act, dtype=torch.float32).to(device))
+
+            actions_tensor = torch.stack(actions)  # [K, action_dim]
+            median_action = weiszfeld_geometric_median(actions_tensor)
+            return median_action.cpu().numpy()
+
+    def _ensemble_rollout(self, device, max_steps=1000, render=False,
+                          save_dir='./', filename='.'):
+        """Run one episode using ensemble prediction for action selection."""
+        from utils import env_wrapper, save_frames_as_gif
+
+        env = self.master.env
+        obs = _reset_env(env)
+        done = False
+        ep_rew = []
+        frames = []
+        step = 0
+
+        while not done and step < max_steps:
+            step += 1
+            if render:
+                frames.append(env.render(mode="rgb_array"))
+
+            obs_wrapped = env_wrapper(env.unwrapped.spec.id, obs)
+            action = self.ensemble_predict(obs_wrapped, device, sample=False)
+            obs, rew, done, _ = _step_env(env, action)
+            ep_rew.append(rew)
+
+        if render:
+            save_frames_as_gif(frames, save_dir, filename)
+
+        return np.sum(ep_rew), len(ep_rew), ep_rew
+
+    def start_validating_ensemble(self, tb_logger=None, id=0, max_steps=1000,
+                                   render=False, run_id=0, mode='human'):
+        """Validation using ensemble prediction (WWW 2025, Algorithm 2).
+
+        Same as start_validating() but uses ensemble_predict() to aggregate
+        actions from all K group policies.
+        """
+        print('\nValidating (ensemble)...', flush=True)
+
+        val_ret = 0.0
+        val_len = 0.0
+
+        for _ in range(self.opts.val_size):
+            epi_ret, epi_len, _ = self._ensemble_rollout(
+                self.opts.device,
+                max_steps=max_steps,
+                render=render,
+                save_dir='./outputs/',
+                filename=f'gym_{run_id}_{_}.gif'
+            )
+            val_ret += epi_ret
+            val_len += epi_len
+
+        val_ret /= self.opts.val_size
+        val_len /= self.opts.val_size
+
+        print('\nGradient step: %3d \t return: %.3f \t ep_len: %.3f' %
+              (id, np.mean(val_ret), np.mean(val_len)))
+
+        if tb_logger is not None:
+            tb_logger.add_scalar(f'validate/total_rewards_{run_id}',
+                                 np.mean(val_ret), id)
+            tb_logger.add_scalar(f'validate/epi_length_{run_id}',
+                                 np.mean(val_len), id)
+            tb_logger.close()
+
+        return np.mean(val_ret)
+
+    # =========================================================================
+    # Ensemble Training (WWW 2025, Algorithm 1)
+    # Each group trains its own global policy independently using the same
+    # foundational aggregation rule.  Groups are trained sequentially.
+    # =========================================================================
+
+    def _start_training_ensemble(self, tb_logger=None, run_id=None):
+        """Train K independent global policies, one per worker group.
+
+        Implements Algorithm 1 from Fang et al. (WWW 2025). Workers are
+        partitioned into K non-overlapping groups by hash(w.id) % K. Each
+        group independently trains a global policy using the same
+        foundational aggregation rule (FedPG-BR or GOMDP).
+
+        At validation time, actions from all K policies are aggregated via
+        majority vote (discrete actions) or geometric median (continuous).
+
+        Args:
+            tb_logger: Optional TensorBoard SummaryWriter.
+            run_id: Integer run identifier for logging.
+        """
+        opts = self.opts
+        K = self.num_groups
+
+        # Shared step counter across all groups
+        step = 0
+        epoch = 0
+        ratios_step = 0
+
+        while step <= opts.max_trajectories:
+            epoch += 1
+
+            print('\n\n')
+            print("|", format(f" Training step {step} run_id {run_id} in {opts.seeds}",
+                              "*^60"), "|")
+
+            # ---- Accumulators for logging (across all groups) ----
+            all_batch_loss = []
+            all_batch_rets = []
+            all_batch_lens = []
+            all_N_good = []
+            all_grad_array = []
+            epoch_traj_total = 0
+
+            # ============================================================
+            # Train each group independently (serial, as requested)
+            # ============================================================
+            for k in range(K):
+                workers_k = self.group_workers[k]
+                world_k = len(workers_k)
+                master_k = self.group_masters[k]
+                old_master_k = self.group_old_masters[k]
+                optimizer_k = self.group_optimizers[k]
+
+                # Turn group-k master into training mode
+                master_k.train()
+                print("Training with lr={:.3e} for group {}/{}".format(
+                    optimizer_k.param_groups[0]['lr'], k + 1, K), flush=True)
+
+                # ---- Distribute group-k master params to group-k workers ----
+                param_k = get_inner_model(master_k.logits_net).state_dict()
+
+                if opts.FedPG_BR:
+                    Batch_size = np.random.randint(opts.Bmin, opts.Bmax + 1)
+                else:
+                    Batch_size = opts.B
+
+                seeds = np.random.randint(1, 100000, world_k).tolist()
+                args = zip(workers_k,
+                           repeat(param_k),
+                           repeat(opts),
+                           repeat(Batch_size),
+                           seeds)
+
+                results = self.pool.starmap(worker_run, args)
+
+                # ---- Collect gradients from group-k workers ----
+                gradient = []
+                for out in tqdm(results, desc=f'Group {k+1}/{K} workers'):
+                    grad, loss, rets, lens = out
+                    gradient.append(grad)
+                    all_batch_loss.append(loss)
+                    all_batch_rets.append(rets)
+                    all_batch_lens.append(lens)
+
+                # ---- Byzantine indices within this group ----
+                byzantine_indices_k = [i for i, w in enumerate(workers_k) if w.is_Byzantine]
+
+                # ---- Server-side attacks (FedScsPG / Normalized) ----
+                if opts.attack_type == 'FedScsPG-attack' and len(byzantine_indices_k) > 0:
+                    for idx, _ in enumerate(master_k.parameters()):
+                        tmp = []
+                        for bad_idx in byzantine_indices_k:
+                            tmp.append(gradient[bad_idx][idx].view(-1))
+                        tmp = torch.stack(tmp)
+                        estimated_2sigma = euclidean_dist(tmp, tmp).max()
+                        estimated_mean = tmp.mean(0)
+                        rnd = torch.rand(gradient[0][idx].shape) * 2. - 1.
+                        rnd = rnd / rnd.norm()
+                        attacked_gradient = (estimated_mean.view(gradient[0][idx].shape)
+                                             + rnd * estimated_2sigma * 3. / 2.)
+                        for bad_idx in byzantine_indices_k:
+                            gradient[bad_idx][idx] = attacked_gradient
+
+                if opts.attack_type == 'normalized-attack' and len(byzantine_indices_k) > 0:
+                    gradient = self._normalized_attack(gradient, opts,
+                                                       byzantine_indices=byzantine_indices_k)
+
+                # ---- Set old master ----
+                old_master_k.load_param_from_master(param_k)
+
+                # ---- Aggregation (FedPG-BR, GOMDP, or SecAgg) ----
+
+                if getattr(opts, 'use_secagg', False):
+                    from secure_aggregation import (
+                        SecureAggregationProtocol, flatten_gradient_list)
+                    flat_g, _ = flatten_gradient_list(gradient)
+                    secagg = SecureAggregationProtocol(
+                        world_k, flat_g.shape[1], opts.device)
+                    masked = [secagg.encrypt_gradient(i, flat_g[i])
+                              for i in range(world_k)]
+                    secagg.verify_cancellation(
+                        [flat_g[i] for i in range(world_k)], masked)
+                    Good_set = torch.ones(
+                        world_k, 1).to(opts.device).bool()
+                    if k == 0:  # print once per epoch
+                        print(f"[SecAgg] all {world_k} workers pass "
+                              f"(FedPG-BR disabled)")
+
+                elif opts.FedPG_BR:
+                    mu_vec = None
+                    for idx, item in enumerate(old_master_k.parameters()):
+                        grad_item = []
+                        for i in range(world_k):
+                            grad_item.append(gradient[i][idx])
+                        grad_item = torch.stack(grad_item).view(world_k, -1)
+                        if mu_vec is None:
+                            mu_vec = grad_item.clone()
+                        else:
+                            mu_vec = torch.cat((mu_vec, grad_item.clone()), -1)
+
+                    dist = euclidean_dist(mu_vec, mu_vec)
+                    V = 2 * np.log(2 * world_k / opts.delta)
+                    sigma = opts.sigma
+                    threshold = 2 * sigma * np.sqrt(V / Batch_size)
+                    alpha = opts.alpha
+
+                    k_prime = (dist <= threshold).sum(-1) > (0.5 * world_k)
+                    if torch.sum(k_prime) > 0:
+                        mu_mean_vec = torch.mean(mu_vec[k_prime], 0).view(1, -1)
+                        mu_med_vec = mu_vec[k_prime][
+                            euclidean_dist(mu_mean_vec, mu_vec[k_prime]).argmin()
+                        ].view(1, -1)
+                        Good_set = euclidean_dist(mu_vec, mu_med_vec) <= 1 * threshold
+                    else:
+                        Good_set = k_prime
+
+                    if (torch.sum(Good_set) < (1 - alpha) * world_k
+                            or torch.sum(Good_set) == 0):
+                        k_prime = ((dist <= 2 * sigma).sum(-1)
+                                   > (0.5 * world_k))
+                        if torch.sum(k_prime) > 0:
+                            mu_mean_vec = torch.mean(mu_vec[k_prime], 0).view(1, -1)
+                            mu_med_vec = mu_vec[k_prime][
+                                euclidean_dist(mu_mean_vec, mu_vec[k_prime]).argmin()
+                            ].view(1, -1)
+                            Good_set = euclidean_dist(mu_vec, mu_med_vec) <= 2 * sigma
+                        else:
+                            Good_set = torch.zeros(world_k, 1).to(opts.device).bool()
+                else:
+                    Good_set = torch.ones(world_k, 1).to(opts.device).bool()
+
+                N_good = torch.sum(Good_set)
+                all_N_good.append(N_good.item())
+
+                # ---- Compute mu (aggregated gradient) ----
+                if N_good > 0:
+                    mu = []
+                    for idx, item in enumerate(old_master_k.parameters()):
+                        grad_item = []
+                        for i in range(world_k):
+                            if Good_set[i]:
+                                grad_item.append(gradient[i][idx])
+                        mu.append(torch.stack(grad_item).mean(0))
+                else:
+                    mu = None
+
+                # ---- Gradient update for group-k master ----
+                grad_array = []
+                if opts.FedPG_BR or opts.SVRPG:
+                    if opts.FedPG_BR:
+                        b = opts.b
+                        N_t = np.random.geometric(
+                            p=1 - Batch_size / (Batch_size + b))
+                    elif opts.SVRPG:
+                        b = opts.b
+                        N_t = opts.N
+
+                    for n in tqdm(range(N_t), desc=f'Group {k+1} master'):
+                        optimizer_k.zero_grad()
+                        (weights, new_logp, _, _, batch_states,
+                         batch_actions) = master_k.collect_experience_for_training(
+                            b, opts.device, record=True,
+                            sample=opts.do_sample_for_training)
+
+                        loss_new = -(new_logp * weights).mean()
+                        master_k.logits_net.zero_grad()
+                        loss_new.backward()
+
+                        if mu:
+                            old_logp = []
+                            for idx_o, obs in enumerate(batch_states):
+                                obs = env_wrapper(opts.env_name, obs)
+                                _, old_log_prob = old_master_k.logits_net(
+                                    torch.as_tensor(obs, dtype=torch.float32).to(opts.device),
+                                    fixed_action=batch_actions[idx_o])
+                                old_logp.append(old_log_prob)
+                            old_logp = torch.stack(old_logp)
+
+                            ratios = torch.exp(old_logp.detach() - new_logp.detach())
+                            ratios_step += 1
+
+                            loss_old = -(old_logp * weights * ratios).mean()
+                            old_master_k.logits_net.zero_grad()
+                            loss_old.backward()
+                            grad_old = [item.grad for item in old_master_k.parameters()]
+
+                            if (torch.abs(ratios.mean()) < 0.995
+                                    or torch.abs(ratios.mean()) > 1.005):
+                                N_t = n
+                                break
+
+                            if tb_logger is not None:
+                                tb_logger.add_scalar(
+                                    f'params/ratios_{run_id}', ratios.mean(), ratios_step)
+
+                            for idx_m, item in enumerate(master_k.parameters()):
+                                item.grad = item.grad - grad_old[idx_m] + mu[idx_m]
+                                grad_array += (item.grad.data.view(-1).cpu().tolist())
+
+                        optimizer_k.step()
+                else:
+                    # GOMDP
+                    b = 0
+                    N_t = 0
+                    for idx_m, item in enumerate(master_k.parameters()):
+                        item.grad = mu[idx_m]
+                        grad_array += (item.grad.data.view(-1).cpu().tolist())
+                    optimizer_k.step()
+
+                all_grad_array.extend(grad_array)
+
+                # ---- Accumulate total trajectories for this group ----
+                epoch_traj_total += Batch_size * world_k + b * N_t
+
+            # ============================================================
+            # End of per-group training — aggregate logging & validate
+            # ============================================================
+
+            # Step increment: per-worker trajectory count
+            # (total worker trajectories + total master trajectories) / num_workers
+            step += round(epoch_traj_total / self.world_size) if self.world_size > 1 else epoch_traj_total
+
+            print('\nepoch: %3d \t loss: %.3f \t return: %.3f \t ep_len: %.3f \t N_good: %s' %
+                  (epoch, np.mean(all_batch_loss), np.mean(all_batch_rets),
+                   np.mean(all_batch_lens), str(all_N_good)))
+
+            # Tensorboard logging
+            if tb_logger is not None:
+                tb_logger.add_scalar(f'train/total_rewards_{run_id}',
+                                     np.mean(all_batch_rets), step)
+                tb_logger.add_scalar(f'train/epi_length_{run_id}',
+                                     np.mean(all_batch_lens), step)
+                tb_logger.add_scalar(f'train/loss_{run_id}',
+                                     np.mean(all_batch_loss), step)
+                if all_grad_array:
+                    tb_logger.add_scalar(f'grad/grad_{run_id}',
+                                         np.mean(all_grad_array), step)
+
+                if run_id not in self.memory.steps.keys():
+                    self.memory.steps[run_id] = []
+                    self.memory.eval_values[run_id] = []
+                    self.memory.training_values[run_id] = []
+
+                self.memory.steps[run_id].append(step)
+                self.memory.training_values[run_id].append(np.mean(all_batch_rets))
+
+            # ---- Ensemble validation (WWW 2025, Algorithm 2) ----
+            eval_reward = self.start_validating_ensemble(
+                tb_logger, step, max_steps=opts.val_max_steps,
+                render=opts.render, run_id=run_id)
+            if tb_logger is not None:
+                self.memory.eval_values[run_id].append(eval_reward)
+
+            # ---- Save all group models ----
+            if not opts.no_saving:
+                self._save_ensemble(epoch, run_id)
+
+    def _save_ensemble(self, epoch, run_id):
+        """Save all K group master policies and optimizers."""
+        print('Saving ensemble models and states...')
+        for k in range(self.num_groups):
+            torch.save(
+                {
+                    'master': get_inner_model(
+                        self.group_masters[k].logits_net).state_dict(),
+                    'optimizer': self.group_optimizers[k].state_dict(),
+                    'rng_state': torch.get_rng_state(),
+                    'cuda_rng_state': (torch.cuda.get_rng_state_all()
+                                       if self.opts.use_cuda else None),
+                },
+                os.path.join(self.opts.save_dir,
+                             f'r{run_id}-epoch-{epoch}-group{k}.pt')
+            )
+
     def start_training(self, tb_logger = None, run_id = None):
-        
+        # ---- Dispatch to ensemble training if enabled ----
+        if self.ensemble:
+            self._start_training_ensemble(tb_logger, run_id)
+            return
+
         # parameters of running
         opts = self.opts
 
@@ -215,7 +1004,7 @@ class Agent:
             
             
             # simulate FedScsPG-attack (if needed) on server for demo
-            if opts.attack_type == 'FedScsPG-attack' and opts.num_Byzantine > 0:  
+            if opts.attack_type == 'FedScsPG-attack' and opts.num_Byzantine > 0:
                 for idx,_ in enumerate(self.master.parameters()):
                     tmp = []
                     for bad_worker in range(opts.num_Byzantine):
@@ -224,20 +1013,42 @@ class Agent:
 
                     estimated_2sigma = euclidean_dist(tmp, tmp).max()
                     estimated_mean = tmp.mean(0)
-                    
+
                     # change the gradient to be estimated_mean + 3sigma (with a random direction rnd)
                     rnd = torch.rand(gradient[0][idx].shape) * 2. - 1.
                     rnd = rnd / rnd.norm()
                     attacked_gradient = estimated_mean.view(gradient[bad_worker][idx].shape) + rnd * estimated_2sigma * 3. / 2.
                     for bad_worker in range(opts.num_Byzantine):
                         gradient[bad_worker][idx] = attacked_gradient
-                        
-              
+
+            # Normalized Attack (WWW 2025, Section 4.2)
+            # Server-side two-stage attack: Stage I optimizes direction (lambda),
+            # Stage II optimizes magnitude (zeta). See _normalized_attack() for details.
+            if opts.attack_type == 'normalized-attack' and opts.num_Byzantine > 0:
+                gradient = self._normalized_attack(gradient, opts)
+
             # make the old policy as a copy of the current master node
             self.old_master.load_param_from_master(param)
             
             # do Aggregate Algorithm to detect Byzantine worker on master node
-            if opts.FedPG_BR:
+
+            # ---- SecAgg: encrypted aggregation, FedPG-BR disabled ----
+            if getattr(opts, 'use_secagg', False):
+                from secure_aggregation import (
+                    SecureAggregationProtocol, flatten_gradient_list)
+                flat_grads, _ = flatten_gradient_list(gradient)
+                secagg = SecureAggregationProtocol(
+                    self.world_size, flat_grads.shape[1], opts.device)
+                masked = [secagg.encrypt_gradient(i, flat_grads[i])
+                          for i in range(self.world_size)]
+                secagg.verify_cancellation(
+                    [flat_grads[i] for i in range(self.world_size)], masked)
+                Good_set = torch.ones(
+                    self.world_size, 1).to(opts.device).bool()
+                print(f"[SecAgg] FedPG-BR disabled: server sees only "
+                      f"masked grads, all {self.world_size} workers pass")
+
+            elif opts.FedPG_BR:
                 
                 # flatten the gradient vectors of each worker and put them together, shape [num_worker, -1]
                 mu_vec = None
@@ -413,8 +1224,8 @@ class Agent:
                 tb_logger.add_scalar(f'params/lr_{run_id}', self.optimizer.param_groups[0]['lr'], step)
                 tb_logger.add_scalar(f'params/N_t_{run_id}', N_t, step)
 
-                # Byzantine filtering log
-                if opts.FedPG_BR:
+                # Byzantine filtering log (skip under SecAgg: dist/ threshold not computed)
+                if opts.FedPG_BR and not getattr(opts, 'use_secagg', False):
                     
                     y_true = self.true_Byzantine
                     y_pred = (~ Good_set).view(-1).cpu().tolist()
