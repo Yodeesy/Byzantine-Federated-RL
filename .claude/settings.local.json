@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(apt-get install *)",
+      "Bash(pip install *)",
+      "Bash(python3 *)",
+      "Bash(chmod +x /mnt/e/FRL_HKUST\\\\\\(GZ\\\\\\)/Byzantine-Federated-RL/run.sh)",
+      "Bash(git add *)",
+      "Bash(git commit -m 'Implement Cross-Group Divergence Attack and SecAgg against WWW 2025 Ensemble Defense *)",
+      "Bash(git push *)"
+    ]
+  }
+}

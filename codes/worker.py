@@ -235,63 +235,89 @@ class Worker:
         self.logits_net.zero_grad()
         batch_loss.backward()
 
-        # ---- Divergence Attack: local synthetic gradient on high-entropy states ----
+        # ---- Decentralized Boundary-Split Attack (DBSA): Two-Stage Local Optimization ----
         if self.is_Byzantine and self.attack_type == 'divergence-attack':
             from torch.distributions.categorical import Categorical
-            from gymnasium.spaces import Discrete
+            import math
 
-            n_actions = (self.env.action_space.n
-                         if isinstance(self.env.action_space, Discrete)
-                         else self.env.action_space.shape[0])
-            max_entropy = np.log(n_actions)
-            threshold = (opts.entropy_threshold
-                         if opts and opts.entropy_threshold is not None
-                         else 0.6 * max_entropy)
-
-            # Cross-Group targeting: each group pushes a DIFFERENT action
-            if (opts and opts.target_action_mode == 'group-mod'
-                    and hasattr(self, 'group_id') and self.group_id >= 0):
-                target_action = self.group_id % n_actions
-            else:
-                target_action = opts.target_action if opts else 0
-
-            # Scan visited states for high-entropy decision boundaries
-            trigger_states = []
+            # Stage I: 计算 \Delta_local(s) 并寻找脆弱状态
+            delta_locals = []
             for obs in batch_states:
                 obs_t = torch.as_tensor(obs, dtype=torch.float32).to(device)
                 logits = self.logits_net.logits_net(obs_t)
-                dist = Categorical(logits=logits)
-                if dist.entropy().item() > threshold:
-                    trigger_states.append(obs_t)
+                probs = torch.softmax(logits, dim=-1)
 
-            if len(trigger_states) > 0:
-                # Save honest gradient
+                # 获取局部概率最大的两个动作 (Top-1 和 Top-2)
+                top2_probs, top2_indices = torch.topk(probs, 2, dim=-1)
+                delta = top2_probs[0] - top2_probs[1]
+
+                # 记录: (差异值, 状态tensor, 局部次优动作)
+                delta_locals.append((delta.item(), obs_t, top2_indices[1].item()))
+
+            # 将状态按 \Delta_local(s) 从小到大排序 (差异越小，说明全局可能越处于分歧边缘)
+            delta_locals.sort(key=lambda x: x[0])
+
+            # 选取排名前 10% (或固定数量) 的最脆弱状态作为触发器
+            num_triggers = max(1, int(len(delta_locals) * 0.1))
+            trigger_data = delta_locals[:num_triggers]
+
+            if len(trigger_data) > 0:
+                # 保存诚实梯度作为基准
                 honest_grad = [p.grad.clone() for p in self.parameters()]
 
-                # Synthetic gradient: push toward target_action on trigger states
-                trigger_tensor = torch.stack(trigger_states)
-                logits_t = self.logits_net.logits_net(trigger_tensor)
-                dist_t = Categorical(logits=logits_t)
-                logp_target = dist_t.log_prob(
-                    torch.tensor(target_action, device=device))
-                loss_syn = -logp_target.mean()  # maximize logp of target action
-
+                # Stage II准备：计算指向各个状态对应的【局部次优动作】的纯恶意梯度
                 self.logits_net.zero_grad()
-                loss_syn.backward()
+                loss_syn = 0
+                for _, obs_t, top2_action in trigger_data:
+                    logits_t = self.logits_net.logits_net(obs_t)
+                    dist_t = Categorical(logits=logits_t)
+                    logp_target = dist_t.log_prob(torch.tensor(top2_action, device=device))
+                    loss_syn -= logp_target  # 最小化该负对数似然，即最大化次优动作概率
 
-                # Combine honest + synthetic, then norm-match for stealth
-                beta = 1.0  # poisoning strength
-                grad = []
-                for h_g, p in zip(honest_grad, self.parameters()):
-                    combined = h_g + beta * p.grad
-                    # Stealth: match norm to original honest gradient
-                    h_norm = h_g.norm() + 1e-10
-                    combined = combined / (combined.norm() + 1e-10) * h_norm
-                    grad.append(combined)
+                loss_syn = loss_syn / len(trigger_data)
+                loss_syn.backward()
+                malicious_grad = [p.grad.clone() for p in self.parameters()]
+
+                # Stage II: 约束求解 max \lambda  s.t. ||g_combined(\lambda) - g_honest||_2 <= \tau_estimate
+                # 攻击者在本地估计服务器端 FedPG-BR 的过滤半径 \tau
+                world_size = opts.num_worker
+                delta_val = opts.delta
+                sigma_val = opts.sigma
+
+                # FedPG-BR 可能会随机采样 Batch_size，攻击者使用期望值进行估计
+                estimated_B = opts.B if not opts.FedPG_BR else (opts.Bmin + opts.Bmax) / 2.0
+
+                V = 2 * np.log(2 * world_size / delta_val)
+                # 乘以 0.9 作为保守估计系数，确保绝对不被过滤
+                tau_estimate = 2 * sigma_val * math.sqrt(V / estimated_B) * 0.9
+
+                best_combined = honest_grad
+                lambda_step = 0.5
+                current_lambda = 0.0
+
+                # 线搜索寻找满足 \tau 约束的最大注入幅度 \lambda
+                for _ in range(50):
+                    test_lambda = current_lambda + lambda_step
+                    combined_grad = []
+                    dist_sq = 0.0
+
+                    for h_g, m_g in zip(honest_grad, malicious_grad):
+                        c_g = h_g + test_lambda * m_g
+                        combined_grad.append(c_g)
+                        dist_sq += torch.sum((c_g - h_g) ** 2).item()
+
+                    dist = math.sqrt(dist_sq)
+
+                    if dist <= tau_estimate:
+                        current_lambda = test_lambda
+                        best_combined = combined_grad
+                    else:
+                        break  # 超出安全半径，停止增加 \lambda
+
+                grad = best_combined
             else:
-                # No trigger states found — return honest gradient
                 grad = [item.grad for item in self.parameters()]
-        # ---- End Divergence Attack ----
+        # ---- End DBSA Attack ----
 
         # determine if the agent is byzantine (other attack types)
         elif self.is_Byzantine and self.attack_type is not None:

@@ -65,18 +65,6 @@ def get_options(args=None):
     parser.add_argument('--zeta_hat', type=float, default=None,
                         help='Override Normalized Attack zeta_hat (default: env-specific)')
 
-    # Divergence Attack (Cross-Group)
-    parser.add_argument('--entropy_threshold', type=float, default=None,
-                        help='Entropy threshold for divergence attack trigger states '
-                             '(default: 0.6 * log(n_actions))')
-    parser.add_argument('--target_action', type=int, default=0,
-                        help='Target action Byzantine workers push toward in divergence attack')
-    parser.add_argument('--target_action_mode', type=str,
-                        choices=['fixed', 'group-mod'], default='fixed',
-                        help='"fixed": all Byzantine push --target_action; '
-                             '"group-mod": each Byzantine pushes group_id %% n_actions')
-        
-    
     # RL Algorithms (default GOMDP)
     parser.add_argument('--SVRPG', action='store_true', 
                         help='run SVRPG')
@@ -154,11 +142,6 @@ def get_options(args=None):
         opts.lambda_hat = 0.83
         opts.zeta_hat = 0.03
 
-        # Divergence attack entropy threshold (0.6 * ln(2))
-        if opts.entropy_threshold is None:
-            opts.entropy_threshold = 0.42
-
-
     elif opts.env_name == 'HalfCheetah-v2':
         # Task-Specified Hyperparameters
         opts.max_epi_len = 500  
@@ -190,10 +173,6 @@ def get_options(args=None):
         # Normalized attack hyperparameters (WWW 2025, Table 4)
         opts.lambda_hat = 0.83
         opts.zeta_hat = 0.2
-
-        # Divergence attack (continuous: use variance-based trigger)
-        if opts.entropy_threshold is None:
-            opts.entropy_threshold = 0.5  # action variance threshold
 
 
     if opts.env_name == 'LunarLander-v2':
@@ -227,10 +206,6 @@ def get_options(args=None):
         # Normalized attack hyperparameters (WWW 2025, Table 4)
         opts.lambda_hat = 1.0
         opts.zeta_hat = 0.02
-
-        # Divergence attack entropy threshold (0.6 * ln(4))
-        if opts.entropy_threshold is None:
-            opts.entropy_threshold = 0.83
 
     # Allow CLI override of key hyperparams for reproduction tuning
     if _sigma_override is not None:
