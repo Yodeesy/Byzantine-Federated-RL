@@ -21,10 +21,9 @@ experiments = [
     'Normalized Attack\nNo Ensemble\n(CartPole)',
     'Normalized Attack\n+ Ensemble\n(CartPole)',
     'Cross-Group\nDivergence\n+ Ensemble\n(LunarLander)',
-    'Divergence +\nFedPG-BR + SecAgg\n(CartPole)',
 ]
-rewards = [500, 432.5, 500, 151.9, 483]
-colors = ['#2ecc71', '#e74c3c', '#3498db', '#c0392b', '#9b59b6']
+rewards = [500, 432.5, 500, 151.9]
+colors = ['#2ecc71', '#e74c3c', '#3498db', '#c0392b']
 
 bars = ax.bar(range(len(experiments)), rewards, color=colors, edgecolor='white', linewidth=1.5)
 
@@ -47,10 +46,6 @@ ax.annotate('Defense\nWorks', xy=(2, 500), xytext=(2.5, 560),
 ax.annotate('Defense\nBroken', xy=(3, 151.9), xytext=(3.5, 280),
             arrowprops=dict(arrowstyle='->', color='red', lw=1.5),
             fontsize=10, color='red', fontweight='bold')
-ax.annotate('Privacy vs\nRobustness\nTrade-off', xy=(4, 483), xytext=(3.5, 580),
-            arrowprops=dict(arrowstyle='->', color='purple', lw=1.5),
-            fontsize=10, color='purple', fontweight='bold')
-
 ax.grid(axis='y', alpha=0.3)
 plt.tight_layout()
 plt.savefig('outputs/fig1_main_results.png', dpi=150, bbox_inches='tight')
@@ -143,52 +138,23 @@ plt.close()
 print("Fig 3 saved.")
 
 # ============================================================
-# Figure 4: N_good comparison — SecAgg vs FedPG-BR
-# ============================================================
-fig, ax = plt.subplots(figsize=(8, 4.5))
-
-groups = ['FedPG-BR\n(No SecAgg)', 'FedPG-BR + SecAgg\n(Encrypted)']
-n_good_vals = [21, 30]
-
-bars3 = ax.bar(groups, n_good_vals, color=['#3498db', '#9b59b6'],
-               edgecolor='white', linewidth=1.5, width=0.4)
-for bar, val in zip(bars3, n_good_vals):
-    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
-            f'N_good = {val}', ha='center', fontweight='bold', fontsize=14)
-
-ax.set_ylabel('Workers Passing Filter', fontsize=12)
-ax.set_title('SecAgg Disables Byzantine Filtering\n(CartPole, 30 workers, 9 Byzantine)',
-             fontsize=13, fontweight='bold')
-ax.set_ylim(0, 36)
-ax.axhline(y=21, color='#e74c3c', linestyle='--', alpha=0.4,
-           label='True Byzantine = 9, Honest = 21')
-ax.axhline(y=30, color='#2ecc71', linestyle='--', alpha=0.4,
-           label='All workers (filter disabled)')
-ax.legend(fontsize=10)
-ax.grid(axis='y', alpha=0.3)
-plt.tight_layout()
-plt.savefig('outputs/fig4_secagg.png', dpi=150, bbox_inches='tight')
-plt.close()
-print("Fig 4 saved.")
-
-# ============================================================
-# Figure 5: Attack success comparison matrix
+# Figure 4: Attack success comparison heatmap
 # ============================================================
 fig, ax = plt.subplots(figsize=(10, 3.5))
 
 data = np.array([
-    [500, 432.5, 500, 151.9, 483],
+    [500, 432.5, 500, 151.9],
 ])
 norm = matplotlib.colors.Normalize(vmin=100, vmax=500)
 
 im = ax.imshow(data, cmap='RdYlGn', aspect='auto', norm=norm)
 
-ax.set_xticks(range(5))
+ax.set_xticks(range(4))
 ax.set_xticklabels(['Baseline\n(No Attack)', 'Normalized\nAttack', 'Normalized\n+ Ensemble',
-                     'Cross-Group\nDivergence\n+ Ensemble', 'Divergence\n+ SecAgg'],
+                     'Cross-Group\nDivergence\n+ Ensemble'],
                     fontsize=9)
 ax.set_yticks([])
-for i in range(5):
+for i in range(4):
     color = 'white' if data[0, i] < 300 else 'black'
     ax.text(i, 0, f'{data[0, i]}', ha='center', va='center',
             fontweight='bold', fontsize=16, color=color)
@@ -197,32 +163,8 @@ ax.set_title('Test Reward Heatmap: Attack vs Defense', fontsize=14, fontweight='
 cbar = plt.colorbar(im, ax=ax, shrink=0.8)
 cbar.set_label('Test Reward', fontsize=11)
 plt.tight_layout()
-plt.savefig('outputs/fig5_heatmap.png', dpi=150, bbox_inches='tight')
+plt.savefig('outputs/fig4_heatmap.png', dpi=150, bbox_inches='tight')
 plt.close()
-print("Fig 5 saved.")
-
-# ============================================================
-# Figure 6: SecAgg cryptographic verification
-# ============================================================
-fig, ax = plt.subplots(figsize=(8, 4))
-
-# Simulated mask cancellation across epochs
-np.random.seed(42)
-epochs = np.arange(1, 51)
-errors = 10 ** (-4 - np.random.uniform(0, 1, 50))  # ~1e-4 to 1e-5
-
-ax.semilogy(epochs, errors, 'o-', color='#9b59b6', markersize=4, alpha=0.7,
-            label='Max cancellation error per epoch')
-ax.axhline(y=1e-4, color='red', linestyle='--', alpha=0.5, label='Verification threshold (1e-4)')
-ax.set_xlabel('Training Epoch', fontsize=12)
-ax.set_ylabel('Mask Cancellation Error (log scale)', fontsize=12)
-ax.set_title('SecAgg Mask Cancellation Verification\n(PRNG-based Pairwise Masking, 30 workers)',
-             fontsize=13, fontweight='bold')
-ax.legend(fontsize=10)
-ax.grid(alpha=0.3)
-plt.tight_layout()
-plt.savefig('outputs/fig6_secagg_verification.png', dpi=150, bbox_inches='tight')
-plt.close()
-print("Fig 6 saved.")
+print("Fig 4 saved.")
 
 print("\nAll figures saved to outputs/")

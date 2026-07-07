@@ -16,7 +16,7 @@ echo ""
 # ------------------------------------------------------------------
 # Experiment 1: Baseline (CartPole, no attack, no ensemble)
 # ------------------------------------------------------------------
-echo "[1/5] Baseline: CartPole, No Attack, No Ensemble"
+echo "[1/4] Baseline: CartPole, No Attack, No Ensemble"
 echo "      Expected: test reward ~500"
 python run.py \
     --env_name CartPole-v1 \
@@ -28,7 +28,7 @@ echo ""
 # ------------------------------------------------------------------
 # Experiment 2: Normalized Attack vs single-group FedPG-BR
 # ------------------------------------------------------------------
-echo "[2/5] Normalized Attack vs FedPG-BR (CartPole)"
+echo "[2/4] Normalized Attack vs FedPG-BR (CartPole)"
 echo "      Expected: test reward ~432 (attack partially effective)"
 python run.py \
     --env_name CartPole-v1 \
@@ -42,7 +42,7 @@ echo ""
 # ------------------------------------------------------------------
 # Experiment 3: Normalized Attack vs Ensemble Defense
 # ------------------------------------------------------------------
-echo "[3/5] Normalized Attack vs Ensemble Defense (CartPole)"
+echo "[3/4] Normalized Attack vs Ensemble Defense (CartPole)"
 echo "      Expected: test reward ~500 (defense holds)"
 python run.py \
     --env_name CartPole-v1 \
@@ -57,31 +57,15 @@ echo ""
 # ------------------------------------------------------------------
 # Experiment 4: Cross-Group Divergence Attack vs Ensemble
 # ------------------------------------------------------------------
-echo "[4/5] Cross-Group Divergence Attack vs Ensemble (LunarLander)"
+echo "[4/4] Cross-Group Divergence Attack vs Ensemble (LunarLander)"
 echo "      Expected: test reward ~152 (defense broken)"
 python run.py \
     --env_name LunarLander-v2 \
     --num_worker 30 \
     --num_Byzantine 10 \
     --attack_type divergence-attack \
-    --target_action_mode group-mod \
     --FedPG_BR \
     --ensemble --num_groups 5 \
-    --no_tb --no_saving
-echo ""
-
-# ------------------------------------------------------------------
-# Experiment 5: SecAgg Cryptographic Experiment
-# ------------------------------------------------------------------
-echo "[5/5] SecAgg + Divergence Attack (CartPole)"
-echo "      Expected: N_good=30 (filtering disabled by encryption)"
-python run.py \
-    --env_name CartPole-v1 \
-    --num_worker 30 \
-    --num_Byzantine 9 \
-    --attack_type divergence-attack \
-    --FedPG_BR \
-    --use_secagg \
     --no_tb --no_saving
 echo ""
 

@@ -173,50 +173,75 @@ class Agent:
                 opts = opts
         ).to(opts.device)
         
-        # figure out all the actors
-        self.workers = []
-        self.true_Byzantine = []
-        for i in range(self.world_size):
-            self.true_Byzantine.append(True if i < opts.num_Byzantine else False)
-            w = Worker(
-                    id = i+1,
-                    is_Byzantine = True if i < opts.num_Byzantine else False,
-                    env_name = opts.env_name,
-                    gamma = opts.gamma,
-                    hidden_units = opts.hidden_units,
-                    activation = opts.activation,
-                    output_activation = opts.output_activation,
-                    attack_type =  opts.attack_type,
-                    max_epi_len = opts.max_epi_len,
-                    opts = opts
-            ).to(opts.device)
-            w.group_id = -1  # non-ensemble mode
-            self.workers.append(w)
-        print(f'{opts.num_worker} workers initilized with {opts.num_Byzantine if opts.num_Byzantine >0 else "None"} of them are Byzantine.')
-
-        # =====================================================================
-        # Ensemble Defense setup (WWW 2025, Section 5)
-        # Partition workers into K non-overlapping groups by hashing worker IDs.
-        # Each group independently trains a global policy using any foundational
-        # aggregation rule (FedPG-BR, GOMDP, etc.).
-        #
-        # During testing:
-        #   Discrete actions  → majority vote (Eq. 10-11)
-        #   Continuous actions → geometric median (Eq. 12)
-        # =====================================================================
+        # ---- figure out all the actors ----
         self.ensemble = opts.ensemble if hasattr(opts, 'ensemble') else False
         self.num_groups = opts.num_groups if hasattr(opts, 'num_groups') else 5
 
-        if self.ensemble:
-            K = self.num_groups
-            # Partition workers by hash(w.id) % K
-            self.group_workers = [[] for _ in range(K)]
-            for w in self.workers:
-                group_idx = hash(w.id) % K
-                w.group_id = group_idx  # for Cross-Group Divergence Attack
-                self.group_workers[group_idx].append(w)
+        self.workers = []
+        self.true_Byzantine = []
 
-            # Create K independent master policies, old masters, and optimizers
+        if self.ensemble:
+            # =================================================================
+            # Ensemble mode: strict Byzantine placement per group.
+            # Only `compromised_groups` receive Byzantine workers; all other
+            # groups remain fully honest.  This gives precise control over
+            # which groups are "infiltrated" (m << K/2).
+            # =================================================================
+            K = self.num_groups
+            workers_per_group = self.world_size // K
+            assert workers_per_group >= 3, (
+                f"Group size must be >= 3 for FedPG-BR to be meaningful; "
+                f"got {workers_per_group} ({self.world_size} / {K})")
+
+            # ---- Control panel: which groups are infiltrated ----
+            if opts.num_Byzantine > 0:
+                # Place Byzantine in the first m groups, 2 per group by default
+                byz_per_group = max(1, opts.num_Byzantine // max(1, opts.num_Byzantine // 2))
+                if byz_per_group < 2:
+                    byz_per_group = 2  # at least 2 per group for statistical stealth
+                m = opts.num_Byzantine // byz_per_group
+                compromised_groups = list(range(m))
+            else:
+                compromised_groups = []
+                byz_per_group = 0
+            # ---------------------------------------------------
+
+            self.group_workers = [[] for _ in range(K)]
+            worker_id_counter = 1
+            for k in range(K):
+                byz_placed = 0
+                for i in range(workers_per_group):
+                    is_byz = (k in compromised_groups
+                              and byz_placed < byz_per_group)
+                    if is_byz:
+                        byz_placed += 1
+
+                    self.true_Byzantine.append(is_byz)
+                    w = Worker(
+                        id=worker_id_counter,
+                        is_Byzantine=is_byz,
+                        env_name=opts.env_name,
+                        gamma=opts.gamma,
+                        hidden_units=opts.hidden_units,
+                        activation=opts.activation,
+                        output_activation=opts.output_activation,
+                        attack_type=opts.attack_type,
+                        max_epi_len=opts.max_epi_len,
+                        opts=opts
+                    ).to(opts.device)
+                    w.group_id = k
+                    self.workers.append(w)
+                    self.group_workers[k].append(w)
+                    worker_id_counter += 1
+
+            group_sizes = [len(g) for g in self.group_workers]
+            byz_counts = [sum(1 for w in g if w.is_Byzantine) for g in self.group_workers]
+            print(f'Ensemble: {K} groups x {workers_per_group} workers '
+                  f'(total {self.world_size})')
+            print(f'  Byzan. per group: {byz_counts}  |  '
+                  f'Compromised groups: {compromised_groups}')
+
+            # ---- Create K independent master policies, old masters, optimizers ----
             self.group_masters = []
             self.group_old_masters = []
             self.group_optimizers = []
@@ -252,11 +277,33 @@ class Agent:
                         optim.Adam(master_k.logits_net.parameters(), lr=opts.lr_model)
                     )
 
-            # Print group sizes
-            group_sizes = [len(g) for g in self.group_workers]
-            print(f'Ensemble mode: {K} groups, sizes: {group_sizes}')
-            print(f'  Byzantine workers per group: '
-                  + ', '.join([str(sum(1 for w in g if w.is_Byzantine)) for g in self.group_workers]))
+        else:
+            # =================================================================
+            # Non-ensemble mode: first N workers are Byzantine (original logic).
+            # =================================================================
+            self.num_groups = 1
+            for i in range(self.world_size):
+                is_byz = (i < opts.num_Byzantine)
+                self.true_Byzantine.append(is_byz)
+                w = Worker(
+                    id=i + 1,
+                    is_Byzantine=is_byz,
+                    env_name=opts.env_name,
+                    gamma=opts.gamma,
+                    hidden_units=opts.hidden_units,
+                    activation=opts.activation,
+                    output_activation=opts.output_activation,
+                    attack_type=opts.attack_type,
+                    max_epi_len=opts.max_epi_len,
+                    opts=opts
+                ).to(opts.device)
+                w.group_id = -1
+                self.workers.append(w)
+
+        byz_total = sum(self.true_Byzantine)
+        print(f'{self.world_size} workers initialized; '
+              f'{byz_total} Byzantine, '
+              f'{self.world_size - byz_total} honest.')
 
         if not opts.eval_only and not self.ensemble:
             # figure out the optimizer
@@ -737,25 +784,8 @@ class Agent:
                 # ---- Set old master ----
                 old_master_k.load_param_from_master(param_k)
 
-                # ---- Aggregation (FedPG-BR, GOMDP, or SecAgg) ----
-
-                if getattr(opts, 'use_secagg', False):
-                    from secure_aggregation import (
-                        SecureAggregationProtocol, flatten_gradient_list)
-                    flat_g, _ = flatten_gradient_list(gradient)
-                    secagg = SecureAggregationProtocol(
-                        world_k, flat_g.shape[1], opts.device)
-                    masked = [secagg.encrypt_gradient(i, flat_g[i])
-                              for i in range(world_k)]
-                    secagg.verify_cancellation(
-                        [flat_g[i] for i in range(world_k)], masked)
-                    Good_set = torch.ones(
-                        world_k, 1).to(opts.device).bool()
-                    if k == 0:  # print once per epoch
-                        print(f"[SecAgg] all {world_k} workers pass "
-                              f"(FedPG-BR disabled)")
-
-                elif opts.FedPG_BR:
+                # ---- Aggregation (FedPG-BR or GOMDP) ----
+                if opts.FedPG_BR:
                     mu_vec = None
                     for idx, item in enumerate(old_master_k.parameters()):
                         grad_item = []
@@ -1031,24 +1061,7 @@ class Agent:
             self.old_master.load_param_from_master(param)
             
             # do Aggregate Algorithm to detect Byzantine worker on master node
-
-            # ---- SecAgg: encrypted aggregation, FedPG-BR disabled ----
-            if getattr(opts, 'use_secagg', False):
-                from secure_aggregation import (
-                    SecureAggregationProtocol, flatten_gradient_list)
-                flat_grads, _ = flatten_gradient_list(gradient)
-                secagg = SecureAggregationProtocol(
-                    self.world_size, flat_grads.shape[1], opts.device)
-                masked = [secagg.encrypt_gradient(i, flat_grads[i])
-                          for i in range(self.world_size)]
-                secagg.verify_cancellation(
-                    [flat_grads[i] for i in range(self.world_size)], masked)
-                Good_set = torch.ones(
-                    self.world_size, 1).to(opts.device).bool()
-                print(f"[SecAgg] FedPG-BR disabled: server sees only "
-                      f"masked grads, all {self.world_size} workers pass")
-
-            elif opts.FedPG_BR:
+            if opts.FedPG_BR:
                 
                 # flatten the gradient vectors of each worker and put them together, shape [num_worker, -1]
                 mu_vec = None
@@ -1224,8 +1237,8 @@ class Agent:
                 tb_logger.add_scalar(f'params/lr_{run_id}', self.optimizer.param_groups[0]['lr'], step)
                 tb_logger.add_scalar(f'params/N_t_{run_id}', N_t, step)
 
-                # Byzantine filtering log (skip under SecAgg: dist/ threshold not computed)
-                if opts.FedPG_BR and not getattr(opts, 'use_secagg', False):
+                # Byzantine filtering log
+                if opts.FedPG_BR:
                     
                     y_true = self.true_Byzantine
                     y_pred = (~ Good_set).view(-1).cpu().tolist()

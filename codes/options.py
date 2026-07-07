@@ -52,11 +52,6 @@ def get_options(args=None):
     parser.add_argument('--num_groups', '-K', type=int, default=5,
                         help='Number of groups for ensemble defense')
 
-    # Secure Aggregation (SecAgg)
-    parser.add_argument('--use_secagg', action='store_true', default=False,
-                        help='Enable secure aggregation. Server sees only '
-                             'masked gradients; FedPG-BR filtering disabled.')
-
     # Override FedPG-BR / Normalized Attack hyperparams (for reproduction tuning)
     parser.add_argument('--sigma', type=float, default=None,
                         help='Override FedPG-BR variance bound sigma (default: env-specific)')
