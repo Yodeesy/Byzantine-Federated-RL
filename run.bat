@@ -41,7 +41,7 @@ REM Experiment 4: Boundary Split Attack vs Ensemble
 REM ------------------------------------------------------------------
 echo [4/4] Boundary Split Attack vs Ensemble (LunarLander^)
 echo       Expected: test reward ~152 (defense broken^)
-python run.py --env_name LunarLander-v2 --num_worker 30 --num_Byzantine 10 --attack_type divergence-attack --FedPG_BR --ensemble --num_groups 5 --no_tb --no_saving
+python run.py --env_name LunarLander-v3 --num_worker 30 --num_Byzantine 4 --attack_type divergence-attack --FedPG_BR --ensemble --num_groups 5 --no_tb --no_saving
 echo.
 
 echo =============================================

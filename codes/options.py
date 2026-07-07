@@ -10,7 +10,7 @@ def get_options(args=None):
     parser = argparse.ArgumentParser('FT-FedScsPG')
 
     ### Overall run settings
-    parser.add_argument('--env_name', '--env', type=str, default='CartPole-v1', choices = ['HalfCheetah-v2', 'LunarLander-v2', 'CartPole-v1'], 
+    parser.add_argument('--env_name', '--env', type=str, default='CartPole-v1', choices = ['HalfCheetah-v2', 'LunarLander-v3', 'CartPole-v1'], 
                         help='OpenAI Gym env name for test')
     parser.add_argument('--eval_only', action='store_true', 
                         help='used only if to evaluate a pre-trained model')
@@ -170,7 +170,7 @@ def get_options(args=None):
         opts.zeta_hat = 0.2
 
 
-    if opts.env_name == 'LunarLander-v2':
+    if opts.env_name == 'LunarLander-v3':
         # Task-Specified Hyperparameters
         opts.max_epi_len = 1000  
         opts.max_trajectories = 1e4

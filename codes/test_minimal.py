@@ -33,7 +33,7 @@ def train_and_eval(label, attack_type, target_action, opts):
 
     sys.argv = [
         'exp',
-        '--env_name', 'LunarLander-v2',
+        '--env_name', 'LunarLander-v3',
         '--num_worker', '6',
         *argv_attack,
         '--FedPG_BR',

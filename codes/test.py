@@ -1,6 +1,6 @@
 # diagnose_ensemble_agreement.py
 # 放在 codes/ 目录下运行
-# 目的：在 LunarLander-v2 上找出5组良性策略预测不一致的状态区域
+# 目的：在 LunarLander-v3 上找出5组良性策略预测不一致的状态区域
 # （即 Ensemble 决策边界，是 Sequential Backdoor 的潜在触发位置）
 
 import numpy as np
@@ -17,7 +17,7 @@ def run_diagnosis():
     import sys
     sys.argv = [
         'diagnose',
-        '--env_name', 'LunarLander-v2',
+        '--env_name', 'LunarLander-v3',
         '--num_worker', '30',
         '--num_Byzantine', '0',
         '--num_groups', '5',
@@ -50,7 +50,7 @@ def run_diagnosis():
     print("Step 2: 采集状态样本")
     print("=" * 60)
 
-    env = gym.make('LunarLander-v2')
+    env = gym.make('LunarLander-v3')
     collected_states = []
     num_episodes = 30
 
@@ -60,7 +60,7 @@ def run_diagnosis():
         steps = 0
         while not done and steps < 500:
             collected_states.append(obs.copy())
-            obs_wrapped = env_wrapper('LunarLander-v2', obs)
+            obs_wrapped = env_wrapper('LunarLander-v3', obs)
             with torch.no_grad():
                 act, _ = agent.group_masters[0].logits_net(
                     torch.as_tensor(obs_wrapped, dtype=torch.float32),
@@ -80,7 +80,7 @@ def run_diagnosis():
     group_actions_list = []   # 每组在各状态上的预测动作
 
     for obs in collected_states:
-        obs_wrapped = env_wrapper('LunarLander-v2', obs)
+        obs_wrapped = env_wrapper('LunarLander-v3', obs)
         obs_tensor = torch.as_tensor(obs_wrapped, dtype=torch.float32)
 
         actions = []

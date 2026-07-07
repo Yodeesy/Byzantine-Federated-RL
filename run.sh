@@ -60,9 +60,9 @@ echo ""
 echo "[4/4] Cross-Group Divergence Attack vs Ensemble (LunarLander)"
 echo "      Expected: test reward ~152 (defense broken)"
 python run.py \
-    --env_name LunarLander-v2 \
+    --env_name LunarLander-v3 \
     --num_worker 30 \
-    --num_Byzantine 10 \
+    --num_Byzantine 4 \
     --attack_type divergence-attack \
     --FedPG_BR \
     --ensemble --num_groups 5 \
