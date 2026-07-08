@@ -16,6 +16,24 @@ def move_to(var, device):
         return {k: move_to(v, device) for k, v in var.items()}
     return var.to(device)
 
+def resolve_env_name(base_name):
+    """Resolve environment name across gymnasium versions.
+
+    Tries common version suffixes (v2, v3, etc.) and returns the first
+    available, falling back to the base name itself.
+    """
+    import gymnasium as _gym
+    versions = ['v4', 'v3', 'v2', 'v1']
+    for v in versions:
+        name = f'{base_name}-{v}'
+        try:
+            _gym.envs.registration._find_spec(name)
+            return name
+        except Exception:
+            continue
+    return base_name  # last resort
+
+
 def env_wrapper(name, obs):
     return obs
 

@@ -43,7 +43,7 @@ python codes/run.py --env_name CartPole-v1 --num_worker 30 --num_Byzantine 9 --a
 python codes/run.py --env_name CartPole-v1 --num_worker 30 --num_Byzantine 9 --attack_type normalized-attack --FedPG_BR --ensemble --num_groups 5 --no_tb --no_saving
 
 # 4. Boundary Split Attack vs Ensemble (LunarLander, m=2 groups infiltrated)
-python codes/run.py --env_name LunarLander-v3 --num_worker 30 --num_Byzantine 4 --attack_type divergence-attack --FedPG_BR --ensemble --num_groups 5 --no_tb --no_saving
+python codes/run.py --env_name LunarLander --num_worker 30 --num_Byzantine 4 --attack_type divergence-attack --FedPG_BR --ensemble --num_groups 5 --no_tb --no_saving
 
 ```
 

@@ -831,6 +831,18 @@ class Agent:
                 N_good = torch.sum(Good_set)
                 all_N_good.append(N_good.item())
 
+                # ---- DIAGNOSTIC: log filtered worker indices in infiltrated groups ----
+                if byzantine_indices_k:
+                    filtered = (~Good_set.view(-1)).nonzero(as_tuple=True)[0].tolist()
+                    byz_set = set(byzantine_indices_k)
+                    filtered_byz = [i for i in filtered if i in byz_set]
+                    filtered_honest = [i for i in filtered if i not in byz_set]
+                    if filtered:
+                        print(f"[BSA-FILTER] Group {k}: N_good={N_good.item()}/"
+                              f"{world_k}, filtered indices={filtered}, "
+                              f"Byz filtered={filtered_byz}, "
+                              f"Honest filtered={filtered_honest}")
+
                 # ---- Compute mu (aggregated gradient) ----
                 if N_good > 0:
                     mu = []

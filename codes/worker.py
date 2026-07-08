@@ -60,7 +60,8 @@ class Worker:
         self.gamma = gamma
         # make environment, check spaces, get obs / act dims
         self.env_name = env_name
-        self.env = gym.make(env_name)
+        from utils import resolve_env_name
+        self.env = gym.make(resolve_env_name(env_name))
         self.attack_type = attack_type
         self.max_epi_len = max_epi_len
         
@@ -295,6 +296,22 @@ class Worker:
 
                 # 将诚实梯度与缩放后的恶意梯度合并： g_combined = g_honest + \lambda * g_syn
                 grad = [h_g + optimal_lambda * m_g for h_g, m_g in zip(honest_grad, malicious_grad)]
+
+                # ---- DIAGNOSTIC: print once per epoch for the first Byzantine ----
+                if not hasattr(self, '_diag_printed'):
+                    self._diag_printed = False
+                if not self._diag_printed:
+                    honest_norm = math.sqrt(sum(torch.sum(h**2).item() for h in honest_grad))
+                    combined_norm = math.sqrt(sum(torch.sum(g**2).item() for g in grad))
+                    print(f"[BSA-DIAG] worker {self.id} (group {self.group_id}): "
+                          f"||g_honest||={honest_norm:.4e}, "
+                          f"||g_syn||={m_norm:.4e}, "
+                          f"tau_est={tau_estimate:.4e}, "
+                          f"lambda*={optimal_lambda:.4e}, "
+                          f"||g_combined||={combined_norm:.4e}, "
+                          f"ratio={combined_norm/(honest_norm+1e-10):.2f}, "
+                          f"triggers={len(trigger_data)}/{len(batch_states)}")
+                    self._diag_printed = True
 
             else:
                 grad = [item.grad for item in self.parameters()]
