@@ -9,6 +9,7 @@ others/
 .DS_Store
 
 .idea
+.claude
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
