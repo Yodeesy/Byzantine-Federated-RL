@@ -282,19 +282,28 @@ class Worker:
                 delta_val = opts.delta
                 sigma_val = opts.sigma
 
-                estimated_B = opts.B if not opts.FedPG_BR else (opts.Bmin + opts.Bmax) / 2.0
+                estimated_B = opts.B if not opts.FedPG_BR else opts.Bmax  # worst-case for deterministic evasion
                 V = 2 * np.log(2 * world_k / delta_val)
                 # 保守估计 0.9，确保绝对安全
                 tau_estimate = 2 * sigma_val * math.sqrt(V / estimated_B) * 0.9
 
-                # 计算恶意梯度的 L2 范数 ||g_syn||_2
+                # 计算恶意梯度和诚实梯度的 L2 范数
                 m_norm_sq = sum(torch.sum(m_g ** 2).item() for m_g in malicious_grad)
-                m_norm = math.sqrt(m_norm_sq) + 1e-10  # 防除零
+                m_norm = math.sqrt(m_norm_sq) + 1e-10
+                honest_norm_sq = sum(torch.sum(h_g ** 2).item() for h_g in honest_grad)
+                honest_norm = math.sqrt(honest_norm_sq) + 1e-10
 
-                # 闭式解析解计算出最佳拉扯力度 \lambda
+                # Closed-form optimal injection: λ_max = τ / ||g_syn||
                 optimal_lambda = tau_estimate / m_norm
 
-                # 将诚实梯度与缩放后的恶意梯度合并： g_combined = g_honest + \lambda * g_syn
+                # Cap: keep combined gradient within 2x honest norm to avoid
+                # outlier detection (||g_syn|| can be tiny on decision boundaries,
+                # causing λ* to explode even though τ constraint is satisfied).
+                max_lambda = 2.0 * honest_norm / m_norm
+                if optimal_lambda > max_lambda:
+                    optimal_lambda = max_lambda
+
+                # g_combined = g_honest + λ · g_syn
                 grad = [h_g + optimal_lambda * m_g for h_g, m_g in zip(honest_grad, malicious_grad)]
 
                 # ---- DIAGNOSTIC: print once per epoch for the first Byzantine ----
@@ -303,11 +312,12 @@ class Worker:
                 if not self._diag_printed:
                     honest_norm = math.sqrt(sum(torch.sum(h**2).item() for h in honest_grad))
                     combined_norm = math.sqrt(sum(torch.sum(g**2).item() for g in grad))
+                    capped = " (capped)" if optimal_lambda < tau_estimate / (m_norm + 1e-10) else ""
                     print(f"[BSA-DIAG] worker {self.id} (group {self.group_id}): "
                           f"||g_honest||={honest_norm:.4e}, "
                           f"||g_syn||={m_norm:.4e}, "
                           f"tau_est={tau_estimate:.4e}, "
-                          f"lambda*={optimal_lambda:.4e}, "
+                          f"lambda*={optimal_lambda:.4e}{capped}, "
                           f"||g_combined||={combined_norm:.4e}, "
                           f"ratio={combined_norm/(honest_norm+1e-10):.2f}, "
                           f"triggers={len(trigger_data)}/{len(batch_states)}")
